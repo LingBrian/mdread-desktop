@@ -1,0 +1,218 @@
+/* ============================================================
+   mdread — local-first markdown reader. Entry point.
+   Imports the stylesheet (Vite extracts it), wires the UI, and
+   boots the app. All behaviour lives in ./modules/*.
+   ============================================================ */
+
+import "./styles/main.scss";
+
+import { $, $$, app, tree, searchInput, recentsToggle, recentsWrap, supportsFSA } from "./modules/dom.js";
+import { state, prefs, savePrefs } from "./modules/state.js";
+import { debounce } from "./modules/util.js";
+import { idbDel } from "./modules/idb.js";
+
+import { newDoc, wireDiskSync } from "./modules/document.js";
+import { openFolder, openFiles, handleDrop, setRoot, wireFallbackInputs } from "./modules/files.js";
+import { openSample } from "./modules/sample.js";
+import { setSidebar, toggleFocus, setMode, applyPrefs, wirePrint } from "./modules/view.js";
+import { closeLibrary, renderTree, expandAllFolders, collapseAllFolders } from "./modules/tree.js";
+import { saveDoc, downloadDoc } from "./modules/save.js";
+import { toggleTypePop, hint, wireUi } from "./modules/ui.js";
+import { renderRecents, getRecents, openRecent } from "./modules/recents.js";
+import { isDesktop } from "./modules/desktop.js";
+import { wireScroll } from "./modules/scroll.js";
+import { insertImages } from "./modules/editor.js";
+import { wireSearch, openSearch } from "./modules/search.js";
+import { wireLinks } from "./modules/links.js";
+import { wireShare, bootShare } from "./modules/share.js";
+import { onKey } from "./modules/keyboard.js";
+import { wireLaunch } from "./modules/launch.js";
+import { applyLanguage, wireLanguageToggle, t } from "./modules/i18n.js";
+import { showFileContextMenu } from "./modules/file-context-menu.js";
+import { isFileContextMenuShortcut } from "./modules/file-context-menu-shortcut.js";
+
+function wire() {
+  // sources
+  $("#newDocBtn").addEventListener("click", () => newDoc());
+  $("#openFolderBtn").addEventListener("click", openFolder);
+  $("#openFilesBtn").addEventListener("click", openFiles);
+  $("#welcomeNew").addEventListener("click", () => newDoc());
+  $("#welcomeFolder").addEventListener("click", openFolder);
+  $("#welcomeFiles").addEventListener("click", openFiles);
+  $("#welcomeSample").addEventListener("click", openSample);
+
+  // sidebar / focus
+  $("#collapseBtn").addEventListener("click", () => setSidebar(false));
+  $("#expandBtn").addEventListener("click", () => setSidebar(true));
+  $("#scrim").addEventListener("click", () => setSidebar(false));
+  $("#closeFolderBtn").addEventListener("click", closeLibrary);
+  $("#treeExpandAll").addEventListener("click", expandAllFolders);
+  $("#treeCollapseAll").addEventListener("click", collapseAllFolders);
+  $("#focusBtn").addEventListener("click", toggleFocus);
+  const openRowMenu = (event) => {
+    const row = event.target?.closest?.(".file");
+    if (!row) return false;
+    const key = row.dataset.desktopPath || row.dataset.path;
+    const file = state.files.find((entry) => (entry.desktopPath || entry.path) === key);
+    if (!file) return false;
+    showFileContextMenu(event, file, row);
+    return true;
+  };
+  tree.addEventListener("contextmenu", openRowMenu);
+  tree.addEventListener("keydown", (event) => {
+    if (isFileContextMenuShortcut(event) && openRowMenu(event)) event.preventDefault();
+  });
+
+  // search
+  searchInput.addEventListener(
+    "input",
+    debounce(() => {
+      state.filter = searchInput.value.trim();
+      renderTree();
+    }, 120)
+  );
+
+  $("#searchFullBtn").addEventListener("click", () => openSearch(searchInput.value.trim() || undefined));
+
+  // mode segmented
+  $$(".seg [data-mode-val]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.modeVal)));
+
+  // actions
+  $("#saveBtn").addEventListener("click", saveDoc);
+  $("#downloadBtn").addEventListener("click", downloadDoc);
+  $("#tocBtn").addEventListener("click", () => {
+    prefs.toc = !prefs.toc;
+    savePrefs();
+    applyPrefs();
+  });
+  $("#typeBtn").addEventListener("click", () => toggleTypePop($("#typeBtn")));
+
+  // theme buttons (both groups)
+  $$("[data-theme-val]").forEach((b) =>
+    b.addEventListener("click", () => {
+      prefs.theme = b.dataset.themeVal;
+      savePrefs();
+      applyPrefs();
+    })
+  );
+  // font + dropcap + sliders
+  $$("[data-font-val]").forEach((b) =>
+    b.addEventListener("click", () => {
+      prefs.font = b.dataset.fontVal;
+      savePrefs();
+      applyPrefs();
+    })
+  );
+  $("#sizeRange").addEventListener("input", (e) => {
+    prefs.size = +e.target.value;
+    savePrefs();
+    applyPrefs();
+  });
+  $("#widthRange").addEventListener("input", (e) => {
+    prefs.width = +e.target.value;
+    savePrefs();
+    applyPrefs();
+  });
+  $("#dropcapToggle").addEventListener("click", () => {
+    prefs.dropcap = !prefs.dropcap;
+    savePrefs();
+    applyPrefs();
+  });
+
+  // recent folders
+  recentsToggle.addEventListener("click", () => {
+    const open = recentsWrap.classList.toggle("open");
+    recentsToggle.setAttribute("aria-expanded", String(open));
+  });
+
+  // drag + drop (whole window)
+  const dz = $("#dropzone");
+  let dragDepth = 0;
+  window.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    if (++dragDepth === 1) dz.classList.add("is-active");
+  });
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("dragleave", (e) => {
+    e.preventDefault();
+    if (--dragDepth <= 0) {
+      dragDepth = 0;
+      dz.classList.remove("is-active");
+    }
+  });
+  window.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    dz.classList.remove("is-active");
+    // Images dropped while editing go into the document, not the library.
+    const files = [...(e.dataTransfer?.files || [])];
+    if (files.length && files.every((f) => f.type.startsWith("image/")) && (await insertImages(files))) return;
+    await handleDrop(e.dataTransfer);
+  });
+
+  // keyboard
+  window.addEventListener("keydown", onKey);
+
+  // listeners that used to be attached at module top-level
+  wireScroll();
+  wireUi();
+  wireShare();
+  wireFallbackInputs();
+  wireDiskSync();
+  wirePrint();
+  wireSearch();
+  wireLinks();
+
+  // warn on unsaved
+  window.addEventListener("beforeunload", (e) => {
+    if (state.files.some((f) => f.dirty)) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+  });
+
+  // add focus-exit hint element
+  const fx = document.createElement("div");
+  fx.className = "focus-exit";
+  fx.textContent = t("focusHint");
+  document.body.appendChild(fx);
+}
+
+async function init() {
+  applyLanguage();
+  wireLanguageToggle();
+  applyPrefs();
+  setSidebar(innerWidth > 820); // start collapsed on phones
+  app.dataset.mode = "read";
+  wire();
+
+  // A /s/<id> or #d= link opens someone else's document instead of the local
+  // library. Decryption happens here, in the browser — see modules/share.js.
+  if (await bootShare()) return;
+
+  if (!supportsFSA && !isDesktop()) {
+    hint(
+      t("browserReadOnlyHint")
+    );
+  }
+
+  // restore recent folders; auto-open the most recent if still permitted
+  try {
+    await idbDel("root").catch(() => {}); // drop the deprecated key so a removed folder can't resurrect
+    const recents = await getRecents();
+    await renderRecents();
+    const recent = recents[0];
+    if (isDesktop() && recent?.desktop) await openRecent(recent);
+    else if (recent?.handle && (await recent.handle.queryPermission({ mode: "readwrite" })) === "granted") await setRoot(recent.handle);
+  } catch {}
+
+  // OS file-handler, wired last on purpose. setRoot() above calls addFiles with
+  // replace=true and then opens lastDoc, so a launch consumed any earlier gets
+  // wiped from the tree and scrolled past. Claiming the queue after the restore
+  // means the launched file appends to the library and wins the final openDoc.
+  wireLaunch();
+
+  // The service worker is registered automatically by vite-plugin-pwa (offline shell).
+}
+
+document.addEventListener("DOMContentLoaded", init);

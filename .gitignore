@@ -1,0 +1,21 @@
+# Reference source checkout (kept local, not part of this repository)
+/reference/
+
+# Built portable releases are published as GitHub Release assets, not source files
+/release/
+
+# Permission-repair recovery records
+/.acl-recovery/
+
+# Node
+node_modules/
+dist/
+.npm-cache/
+
+# Tauri / Rust build artifacts
+src-tauri/target/
+
+# Local environment
+.env
+.env.*
+!.env.example

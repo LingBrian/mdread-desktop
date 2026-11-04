@@ -1,0 +1,432 @@
+/* End-to-end encrypted sharing.
+
+   mdread stays local-first: nothing leaves the device until you press Share,
+   and even then the server only ever holds ciphertext. The AES key lives in
+   the URL *fragment*, which browsers never transmit — so the link is the
+   capability, and we cannot read what you shared.
+
+   Three link shapes, all handled by `bootShare()` at startup:
+     /s/<id>#k=<key>   stored  — ciphertext in Workers KV, expires
+     #d=<payload>      self-contained — nothing is uploaded at all
+     /c/<id>#k=<key>   live co-editing room (SPIKE) — see modules/collab.js.
+                       No bundle is uploaded: the document itself arrives as
+                       sealed CRDT updates over a WebSocket.
+
+   The bundle format itself — and the promise that old links keep opening — is
+   in bundle.js. It is gzipped and sealed before it ever touches the network. */
+
+import { state } from "./state.js";
+import { t, localizeMessage } from "./i18n.js";
+import { $, $$, app, MD_RE } from "./dom.js";
+import { getText } from "./editor.js";
+import { readJSON } from "./util.js";
+import { newKey, exportKey, toB64url } from "./crypto.js";
+import { BUNDLE_V, sealBundle, openBundle, packInline, unpackInline, encodeAsset, decodeAsset } from "./bundle.js";
+import { localImageRefs, resolvePath } from "./refs.js";
+import { fileAt, resetAssets } from "./assets.js";
+import { renderTree } from "./tree.js";
+import { openDoc } from "./document.js";
+import { toast } from "./ui.js";
+import { shareDaysRemaining } from "./share-expiry.js";
+
+const MAX_PLAINTEXT = 2 * 1024 * 1024; // 2 MB of markdown is a very large folder
+const MAX_PAYLOAD = 1024 * 1024; // matches the Worker's cap
+const INLINE_MAX = 8000; // base64url chars — keeps self-contained links pasteable
+// Raw image bytes per stored link. base64 adds a third, gzip takes little back
+// from already-compressed images, so this keeps text + images under MAX_PAYLOAD.
+const MAX_IMAGES = 640 * 1024;
+const SHARES_KEY = "markread:shares";
+
+/* ---------------- the local record of what you've shared ----------------
+   Kept so you can re-copy or revoke a link later. The key is stored too:
+   it's your own document, on your own device, and without it the entry
+   would be useless. Never sent anywhere. */
+
+export const readShares = () => {
+  const v = readJSON(SHARES_KEY);
+  return Array.isArray(v) ? v : [];
+};
+export const writeShares = (list) => localStorage.setItem(SHARES_KEY, JSON.stringify(list));
+
+function rememberShare(rec) {
+  writeShares([rec, ...readShares().filter((s) => s.id !== rec.id)].slice(0, 200));
+}
+
+function forgetShare(id) {
+  writeShares(readShares().filter((s) => s.id !== id));
+}
+
+/* ---------------- building a bundle ---------------- */
+
+async function contentOf(f) {
+  if (f.content != null) return f.content;
+  if (f.handle) return (await f.handle.getFile()).text();
+  if (f.file) return f.file.text();
+  return "";
+}
+
+/* The images the bundle's documents reference, read from the open folder, up to
+   MAX_IMAGES in total. Ones that don't fit or can't be found are left out and
+   counted, so the dialog can say so; the documents still render without them. */
+async function bundleImages(files) {
+  const paths = new Set();
+  for (const f of files) {
+    for (const src of localImageRefs(f.content)) {
+      const p = resolvePath(f.path, src);
+      if (p) paths.add(p);
+    }
+  }
+  const assets = [];
+  let bytes = 0;
+  let skipped = 0;
+  for (const path of paths) {
+    const file = await fileAt(path).catch(() => null);
+    if (!file) continue; // not beside the document — nothing to send
+    if (bytes + file.size > MAX_IMAGES) {
+      skipped++;
+      continue;
+    }
+    bytes += file.size;
+    assets.push(encodeAsset(path, file.type, new Uint8Array(await file.arrayBuffer())));
+  }
+  return { assets, skipped };
+}
+
+async function buildBundle(scope, { images = false } = {}) {
+  const picked = scope === "folder" ? state.files : [state.current];
+  const files = [];
+  let total = 0;
+
+  for (const f of picked) {
+    if (!f) continue;
+    let content;
+    try {
+      content = await contentOf(f);
+    } catch {
+      continue; // a file we can no longer read just drops out of the bundle
+    }
+    total += content.length;
+    if (total > MAX_PLAINTEXT) throw new Error("That's too much to share at once (over 2 MB of text)");
+    files.push({ path: f.path, name: f.name, content });
+  }
+
+  if (!files.length) throw new Error("Nothing to share");
+  const name = scope === "folder" ? state.rootName || "Shared folder" : files[0].name.replace(MD_RE, "");
+  const bundle = { v: BUNDLE_V, kind: scope, name, files };
+  let skipped = 0;
+  if (images) {
+    const found = await bundleImages(files);
+    if (found.assets.length) bundle.assets = found.assets;
+    skipped = found.skipped;
+  }
+  return { bundle, skipped };
+}
+
+/* ---------------- creating a share ---------------- */
+
+// Self-contained links are text only: an image would blow far past INLINE_MAX.
+export async function createShare({ scope, inline, expiryDays }) {
+  const { bundle, skipped } = await buildBundle(scope, { images: !inline });
+  const { payload, keyStr } = await sealBundle(bundle);
+
+  if (inline) {
+    const data = packInline(payload, keyStr);
+    if (data.length > INLINE_MAX) throw new Error("Too long for a self-contained link — use an encrypted link instead");
+    return { url: `${location.origin}/#d=${data}`, inline: true, name: bundle.name };
+  }
+
+  if (payload.length > MAX_PAYLOAD) throw new Error("That's too much to share at once (over 1 MB encrypted)");
+
+  const res = await fetch("/api/share", {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream", "x-mdread-expiry-days": String(expiryDays) },
+    body: payload,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Share failed (${res.status})`);
+  }
+
+  const { id, deleteToken, expiresAt } = await res.json();
+  const url = `${location.origin}/s/${id}#k=${keyStr}`;
+  rememberShare({ id, key: keyStr, deleteToken, name: bundle.name, kind: scope, count: bundle.files.length, expiresAt });
+  return { url, inline: false, name: bundle.name, expiresAt, images: bundle.assets?.length || 0, skipped };
+}
+
+/* ---------------- co-editing rooms (spike) ----------------
+
+   Nothing is uploaded here. We mint a room id and a key, open the socket, and
+   the current document becomes the room's first update. Yjs is loaded lazily
+   so a reader who never co-edits never downloads it. */
+
+export async function createRoomLink() {
+  const f = state.current;
+  if (!f) throw new Error("Open a document first");
+
+  const id = toB64url(crypto.getRandomValues(new Uint8Array(9))); // 12 chars, unguessable
+  const key = await newKey();
+  const keyStr = await exportKey(key);
+
+  const { enterRoom } = await import("./collab.js");
+  await enterRoom({
+    id,
+    keyStr,
+    seed: {
+      name: f.name,
+      text: app.dataset.mode === "read" ? f.content || "" : getText(),
+    },
+  });
+
+  return { url: `${location.origin}/c/${id}#k=${keyStr}`, name: f.name };
+}
+
+export async function revokeShare(id) {
+  const rec = readShares().find((s) => s.id === id);
+  if (!rec) return;
+  try {
+    await fetch(`/api/share/${id}`, { method: "DELETE", headers: { "x-mdread-delete-token": rec.deleteToken } });
+  } catch {
+    /* the local record goes either way — a stale server entry still expires on its own */
+  }
+  forgetShare(id);
+}
+
+/* ---------------- receiving a share ---------------- */
+
+function incomingLink() {
+  const hash = location.hash || "";
+  if (hash.startsWith("#d=")) return { inline: true, data: hash.slice(3) };
+
+  const k = hash.startsWith("#k=") ? hash.slice(3) : "";
+
+  const c = location.pathname.match(/^\/c\/([A-Za-z0-9_-]{8,64})\/?$/);
+  if (c) return { room: true, id: c[1], keyStr: k };
+
+  const m = location.pathname.match(/^\/s\/([A-Za-z0-9_-]{6,64})\/?$/);
+  if (m) return { inline: false, id: m[1], keyStr: k };
+  return null;
+}
+
+// Returns true when the app booted into a shared document, so init() can skip
+// restoring the local library.
+export async function bootShare() {
+  const link = incomingLink();
+  if (!link) return false;
+
+  app.dataset.shared = "loading";
+  try {
+    if (link.room) {
+      if (!link.keyStr) throw new Error("This link is missing its key — it may have been truncated when it was copied");
+      const { enterRoom } = await import("./collab.js");
+      await enterRoom({ id: link.id, keyStr: link.keyStr });
+      // A room is a live document you can edit, not a read-only share, so the
+      // [data-shared] chrome (which hides save and the mode switch) stays off.
+      delete app.dataset.shared;
+      return true;
+    }
+
+    let payload, keyStr;
+
+    if (link.inline) {
+      ({ payload, keyStr } = unpackInline(link.data));
+    } else {
+      if (!link.keyStr) throw new Error("This link is missing its key — it may have been truncated when it was copied");
+      keyStr = link.keyStr;
+      const res = await fetch(`/api/share/${link.id}`);
+      if (res.status === 404) throw new Error("This share has expired or been revoked");
+      if (!res.ok) throw new Error(`Could not load this share (${res.status})`);
+      payload = new Uint8Array(await res.arrayBuffer());
+    }
+
+    await mountBundle(await openBundle(payload, keyStr));
+    return true;
+  } catch (e) {
+    app.dataset.shared = "error";
+    $("#sharedError").textContent = localizeMessage(e.message) || t("shareCouldNotOpen");
+    return true; // still "handled" — don't fall through to the local library
+  }
+}
+
+async function mountBundle(bundle) {
+  state.shared = true;
+  state.rootName = bundle.name;
+  // Shared images join the same lookup a read-only folder uses (assets.js).
+  resetAssets();
+  for (const a of bundle.assets || []) {
+    const { path, type, bytes } = decodeAsset(a);
+    state.assets.set(path, new File([bytes], path.split("/").pop(), { type }));
+  }
+  state.files = bundle.files.map((f) => ({
+    name: f.name,
+    path: f.path,
+    content: f.content,
+    handle: null,
+    file: null,
+    dirty: false,
+    draft: false,
+    fromShare: true,
+  }));
+
+  app.dataset.shared = "on";
+  $("#sharedName").textContent = bundle.name;
+  $("#sharedCount").textContent =
+    bundle.kind === "folder"
+      ? t("shareFileCount", { count: state.files.length, plural: state.files.length === 1 ? "" : "s" })
+      : t("shareSharedDocument");
+
+  renderTree();
+  await openDoc(state.files[0]);
+}
+
+/* ---------------- the share dialog ---------------- */
+
+const dlg = () => $("#shareDlg");
+
+function syncDialog() {
+  const folderScope = $("#shareScopeFolder");
+  const n = state.files.length;
+  folderScope.disabled = n < 2;
+  folderScope.closest(".share__opt").hidden = n < 2;
+  $("#shareFolderCount").textContent = t("shareFileCount", { count: n, plural: n === 1 ? "" : "s" });
+  // A room has no stored bundle, so link type and expiry don't apply to it.
+  const live = $("#shareCoedit").checked;
+  $("#shareLinkTypeGroup").hidden = live;
+  $("#shareExpiryRow").hidden = live || $("#shareInline").checked;
+  $("#shareCreate").textContent = live ? t("shareStartCoedit") : t("shareCreateLink");
+  renderShareList();
+}
+
+function renderShareList() {
+  const list = $("#shareList");
+  const shares = readShares();
+  $("#shareListWrap").hidden = !shares.length;
+  list.innerHTML = "";
+
+  for (const s of shares) {
+    const row = document.createElement("div");
+    row.className = "share__row";
+    const left = document.createElement("div");
+    left.className = "share__row-main";
+    const title = document.createElement("span");
+    title.className = "share__row-name";
+    title.textContent = s.name;
+    const meta = document.createElement("span");
+    meta.className = "share__row-meta";
+    const days = shareDaysRemaining(s.expiresAt);
+    const files = s.kind === "folder" ? t("shareFileCount", { count: s.count, plural: s.count === 1 ? "" : "s" }) : t("shareOneFile");
+    const expired = days === 0;
+    meta.textContent = days == null
+      ? t("shareExpiryUnknown", { files })
+      : expired
+        ? t("shareExpiredMeta", { files })
+        : t("shareExpiryMeta", { files, days });
+    left.append(title, meta);
+
+    const copy = document.createElement("button");
+    copy.className = "btn btn--tiny";
+    copy.textContent = t("shareCopyLink");
+    copy.disabled = expired;
+    copy.title = expired ? t("shareExpired") : "";
+    copy.addEventListener("click", () => copyLink(`${location.origin}/s/${s.id}#k=${s.key}`));
+
+    const kill = document.createElement("button");
+    kill.className = "btn btn--tiny btn--danger";
+    kill.textContent = t(expired ? "shareRemoveLink" : "shareRevoke");
+    kill.addEventListener("click", async () => {
+      kill.disabled = true;
+      if (expired) {
+        forgetShare(s.id);
+        renderShareList();
+        toast(t("shareLinkRemoved"));
+        return;
+      }
+      await revokeShare(s.id);
+      renderShareList();
+      toast(t("shareLinkRevoked"));
+    });
+
+    row.append(left, copy, kill);
+    list.append(row);
+  }
+}
+
+export async function copyLink(url) {
+  try {
+    await navigator.clipboard.writeText(url);
+    toast(t("shareLinkCopied"));
+  } catch {
+    toast(t("shareCopyFailed"));
+  }
+}
+
+export function openShareDialog() {
+  if (state.shared) return; // you're reading someone else's share — nothing of yours to share
+  if (!state.current) return toast(t("shareOpenDocument"));
+  $("#shareResult").hidden = true;
+  $("#shareCreate").hidden = false;
+  $("#shareError").hidden = true;
+  $("#shareLiveNote").hidden = true;
+  syncDialog();
+  dlg().showModal();
+}
+
+export function wireShare() {
+  const d = dlg();
+  if (!d) return;
+
+  $("#shareBtn").addEventListener("click", openShareDialog);
+  $("#shareClose").addEventListener("click", () => d.close());
+  d.addEventListener("click", (e) => {
+    if (e.target === d) d.close(); // backdrop
+  });
+  $$("input[name=shareLinkType]").forEach((r) => r.addEventListener("change", syncDialog));
+  $("#shareCoedit").addEventListener("change", syncDialog);
+
+  $("#shareCreate").addEventListener("click", async () => {
+    const btn = $("#shareCreate");
+    const err = $("#shareError");
+    btn.disabled = true;
+    btn.textContent = $("#shareCoedit").checked ? t("shareOpeningRoom") : t("shareEncrypting");
+    err.hidden = true;
+    try {
+      const live = $("#shareCoedit").checked;
+      const out = live
+        ? await createRoomLink()
+        : await createShare({
+            scope: $("#shareScopeFolder").checked ? "folder" : "file",
+            inline: $("#shareInline").checked,
+            expiryDays: +$("#shareExpiry").value,
+          });
+      $("#shareLiveNote").hidden = !live;
+      const imgNote = $("#shareImagesNote");
+      const n = out.images || 0;
+      const plural = n === 1 ? "" : "s";
+      const included = n ? t("shareImagePrefix", { count: n, plural }) : "";
+      imgNote.textContent = out.skipped
+        ? t("shareImagesSkipped", { included, count: out.skipped, maxKb: MAX_IMAGES / 1024 })
+        : n
+          ? t("shareImageIncluded", { count: n, plural })
+          : "";
+      imgNote.hidden = !imgNote.textContent;
+      $("#shareUrl").value = out.url;
+      $("#shareResult").hidden = false;
+      btn.hidden = true;
+      $("#shareUrl").select();
+      renderShareList();
+    } catch (e) {
+      err.textContent = localizeMessage(e.message) || t("shareCreateFailed");
+      err.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = $("#shareCoedit").checked ? t("shareStartCoedit") : t("shareCreateLink");
+    }
+  });
+
+  $("#shareCopy").addEventListener("click", () => copyLink($("#shareUrl").value));
+
+  document.addEventListener("mdread:language", () => {
+    if (d.open) syncDialog();
+    else renderShareList();
+  });
+}
